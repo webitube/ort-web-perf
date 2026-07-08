@@ -117,10 +117,17 @@ Ensure your environment has the following installed:
 
 Install dependencies via:
 
+
+
 ```bash
+conda create -n ort-web-perf
+conda activate ort-web-perf
+conda install -c nvidia cuda-toolkit
 pip install -U transformers diffusers optimum onnxruntime-gpu transformers onnx "optimum-onnx[onnxruntime-gpu]" accelerate onnxscript
-pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
+pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 ```
+Note: Ensure that the version of cuda that you install for torch torchvision torchaudio must matctch the first CUDA in the path which, at this time, is 12.4
+
 
 ## **Running the Pipeline**
 

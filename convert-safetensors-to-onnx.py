@@ -262,12 +262,18 @@ def load_safetensors_directly(input_path, original_config_file):
         prediction_type="v_prediction",
     )
 
+    # --- Tokenizer ---
+    print("  Creating tokenizer...")
+    from transformers import CLIPTokenizer
+    tokenizer_name = "openai/clip-vit-large-patch14" if is_sd2 else "openai/clip-vit-base-patch32"
+    tokenizer = CLIPTokenizer.from_pretrained(tokenizer_name)
+
     # --- Build Pipeline ---
     print("  Building pipeline...")
     pipeline = StableDiffusionPipeline(
         vae=vae,
         text_encoder=text_encoder,
-        tokenizer=None,
+        tokenizer=tokenizer,
         unet=unet,
         scheduler=scheduler,
         safety_checker=None,
@@ -463,10 +469,53 @@ def step3_optimize_onnx(output_onnx_dir):
                 print(f"    Removed: {os.path.relpath(data_file, output_onnx_dir)}")
 
 
-def step4_wrap_fp16(output_onnx_dir, script_dir):
+def step4_copy_metadata(diffusers_dir, output_onnx_dir):
+    """Copy metadata files (config.json, tokenizer, scheduler, etc.) from diffusers dir to ONNX output."""
+    print("=" * 60)
+    print("Step 4: Copying metadata files...")
+    print("=" * 60)
+
+    # Copy per-component config.json files
+    for component in ["text_encoder", "unet", "vae_decoder", "vae_encoder"]:
+        src_config = os.path.join(diffusers_dir, component, "config.json")
+        dst_dir = os.path.join(output_onnx_dir, component)
+        if os.path.exists(src_config):
+            os.makedirs(dst_dir, exist_ok=True)
+            shutil.copy2(src_config, os.path.join(dst_dir, "config.json"))
+            print(f"  Copied: {component}/config.json")
+
+    # Copy scheduler config
+    src_scheduler = os.path.join(diffusers_dir, "scheduler")
+    dst_scheduler = os.path.join(output_onnx_dir, "scheduler")
+    if os.path.isdir(src_scheduler):
+        shutil.copytree(src_scheduler, dst_scheduler, dirs_exist_ok=True)
+        print(f"  Copied: scheduler/")
+
+    # Copy tokenizer files
+    src_tokenizer = os.path.join(diffusers_dir, "tokenizer")
+    dst_tokenizer = os.path.join(output_onnx_dir, "tokenizer")
+    if os.path.isdir(src_tokenizer):
+        shutil.copytree(src_tokenizer, dst_tokenizer, dirs_exist_ok=True)
+        print(f"  Copied: tokenizer/")
+
+    # Copy model_index.json (may already exist, ensure it's up to date)
+    src_index = os.path.join(diffusers_dir, "model_index.json")
+    if os.path.exists(src_index):
+        shutil.copy2(src_index, os.path.join(output_onnx_dir, "model_index.json"))
+        print(f"  Copied: model_index.json")
+
+    # Copy any other top-level files (e.g., README, LICENSE)
+    for fname in os.listdir(diffusers_dir):
+        fpath = os.path.join(diffusers_dir, fname)
+        if os.path.isfile(fpath) and fname.endswith((".md", ".txt", ".py")):
+            shutil.copy2(fpath, os.path.join(output_onnx_dir, fname))
+            print(f"  Copied: {fname}")
+
+
+def step5_wrap_fp16(output_onnx_dir, script_dir):
     """Wrap fp16 inputs/outputs with Cast nodes for ORT-Web compatibility."""
     print("=" * 60)
-    print("Step 4: Wrapping fp16 I/O with Cast nodes...")
+    print("Step 5: Wrapping fp16 I/O with Cast nodes...")
     print("=" * 60)
 
     wrap_script = os.path.join(script_dir, "onnx-wrap-fp16.py")
@@ -520,11 +569,14 @@ def main():
     # Step 3: Optimize ONNX
     if not args.no_optimize:
         step3_optimize_onnx(onnx_dir)
-    
-    # Step 4: Wrap fp16 I/O
+
+    # Step 4: Copy metadata files (before cleanup)
+    step4_copy_metadata(diffusers_dir, onnx_dir)
+
+    # Step 5: Wrap fp16 I/O
     if not args.no_wrap_fp16:
-        step4_wrap_fp16(onnx_dir, script_dir)
-    
+        step5_wrap_fp16(onnx_dir, script_dir)
+
     # Cleanup intermediate dir
     if os.path.exists(diffusers_dir):
         print(f"\nCleaning up intermediate directory: {diffusers_dir}")

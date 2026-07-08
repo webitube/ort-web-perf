@@ -278,8 +278,9 @@ def run_test(args):
 
     # Build provider chain based on --provider flag
     # Check which providers are actually available
+    ort.preload_dlls()
     available_providers = ort.get_available_providers()
-    print(f"  Available providers: {', '.join(available_providers)}")
+    print(f"  Available providers: {', '.join(available_providers)}, args.provider={args.provider}")
 
     if args.provider == "cpu":
         providers = [("CPUExecutionProvider", {})]
@@ -308,6 +309,11 @@ def run_test(args):
             providers = [("CPUExecutionProvider", {})]
 
     sess_options = ort.SessionOptions()
+
+    # Level 1 (Basic) stops complex transformer/attention fusion that causes the cast bug
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+    
+    
     sess_options.enable_mem_pattern = False
     sess_options.enable_cpu_mem_arena = False
     # Disable graph optimizations that can cause issues with pre-optimized models
@@ -317,6 +323,8 @@ def run_test(args):
     sess_options.add_session_config_entry("session.use_device_allocator_for_initializers", "1")
     sess_options.add_session_config_entry("session.use_ort_model_bytes_directly", "1")
     sess_options.add_session_config_entry("session.use_ort_model_bytes_for_initializers", "1")
+
+    # session = ort.InferenceSession("model.onnx", options=options, providers=['CUDAExecutionProvider'])
 
     start = time.time()
     text_encoder = ort.InferenceSession(
@@ -344,9 +352,21 @@ def run_test(args):
 
     # Run text encoder
     print("\n[4/6] Running text encoder...")
-    input_ids = np.array([tokens], dtype=np.int32)
+    
+    # Detect expected dtype from model inputs (e.g. "tensor(int64)" -> np.int64)
+    input_info = {inp.name: inp for inp in text_encoder.get_inputs()}
+    ids_type_str = input_info["input_ids"].type if "input_ids" in input_info else "tensor(int32)"
+    ids_dtype = np.int64 if "int64" in ids_type_str else np.int32
+    input_ids = np.array([tokens], dtype=ids_dtype)
+    
+    # Build input feed - some models require attention_mask
+    text_encoder_inputs = {"input_ids": input_ids}
+    for input_name in input_info:
+        if input_name != "input_ids":
+            text_encoder_inputs[input_name] = np.ones_like(input_ids)
+    
     start = time.time()
-    enc_outputs = text_encoder.run(None, {"input_ids": input_ids})
+    enc_outputs = text_encoder.run(None, text_encoder_inputs)
     last_hidden_state = enc_outputs[0]
     print(f"  ✓ Encoded in {time.time() - start:.1f}s")
     print(f"    Output shape: {last_hidden_state.shape}")
@@ -362,11 +382,19 @@ def run_test(args):
 
     timestep = np.array([999], dtype=np.int64)
 
-    feed = {
-        "sample": latent_model_input,
-        "timestep": timestep,
-        "encoder_hidden_states": last_hidden_state,
-    }
+    # Build feed dynamically based on actual UNet input names
+    unet_input_map = {inp.name: inp for inp in unet.get_inputs()}
+    feed = {}
+    for name, inp in unet_input_map.items():
+        if "sample" in name and "hidden" not in name:
+            feed[name] = latent_model_input
+        elif "timestep" in name:
+            feed[name] = timestep
+        elif "encoder" in name or "hidden" in name:
+            feed[name] = last_hidden_state
+        else:
+            shape = [1 if (s is None or isinstance(s, str)) else s for s in inp.shape]
+            feed[name] = np.zeros(shape, dtype=np.float32)
 
     start = time.time()
     unet_outputs = unet.run(None, feed)
@@ -386,7 +414,8 @@ def run_test(args):
     # VAE decode
     print("\n[6/6] Running VAE decoder...")
     start = time.time()
-    vae_outputs = vae_decoder.run(None, {"latent_sample": vae_latent})
+    vae_input_name = vae_decoder.get_inputs()[0].name
+    vae_outputs = vae_decoder.run(None, {vae_input_name: vae_latent})
     sample = vae_outputs[0]
     print(f"  ✓ Decoded in {time.time() - start:.1f}s")
     print(f"    Output shape: {sample.shape}")

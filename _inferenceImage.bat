@@ -1,0 +1,1 @@
+python test-model-cli.py --model-path sd-turbo-ort-web --prompt "a photo of an astronaut riding a horse" --output test-sd-turbo.png --seed 42
