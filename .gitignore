@@ -1,1 +1,6 @@
 *.safetensors
+__pycache__/
+mangledMerge-onnx/
+mangledMerge-onnx-fp16-diffusers-intermediate/
+mangledMerge-onnx-fp16/
+mangledMerge-onnx-fp16-opt-tmp/

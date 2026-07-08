@@ -1,0 +1,1 @@
+python .\convert-safetensors-to-onnx.py --input .\mangledMerge\mangledMerge_v3.safetensors --output mangledMerge-onnx-fp16 --original-config .\sd21-inference.yaml
