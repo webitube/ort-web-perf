@@ -8,6 +8,11 @@
         "/^conda activate ort-web-perf ; python -c \"import diffusers; print\\('diffusers version:', diffusers\\.__version__\\); import os; scripts_dir = os\\.path\\.join\\(os\\.path\\.dirname\\(diffusers\\.__file__\\), 'scripts'\\); print\\('scripts dir:', scripts_dir\\); convert_script = os\\.path\\.join\\(scripts_dir, 'convert_original_stable_diffusion_to_diffusers\\.py'\\); print\\('convert script exists:', os\\.path\\.exists\\(convert_script\\)\\)\"$/": {
             "approve": true,
             "matchCommandLine": true
+        },
+        "pip": true,
+        "/^python test-model-cli\\.py --model-path sd-turbo-ort-web --prompt \"a photo of an astronaut riding a horse\" --output test-sd-turbo\\.png --seed 42$/": {
+            "approve": true,
+            "matchCommandLine": true
         }
     }
 }

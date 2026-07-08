@@ -277,6 +277,10 @@ def run_test(args):
     print("\n[3/6] Loading ONNX sessions...")
 
     # Build provider chain based on --provider flag
+    # Check which providers are actually available
+    available_providers = ort.get_available_providers()
+    print(f"  Available providers: {', '.join(available_providers)}")
+
     if args.provider == "cpu":
         providers = [("CPUExecutionProvider", {})]
     elif args.provider == "cuda":
@@ -288,20 +292,20 @@ def run_test(args):
             })
         ]
     else:  # "auto" or "tensorrt"
-        # Recommended: TensorRT (FP16 + engine cache) → CUDA → CPU fallback
-        providers = [
-            ("TensorrtExecutionProvider", {
-                "trt_fp16_enable": 1,
-                "trt_engine_cache_enable": 1,
-                "trt_engine_cache_path": "./trt_engines",
-            }),
-            ("CUDAExecutionProvider", {
-                "device_id": 0,
-                "arena_extend_strategy": "kSameAsRequested",
-                "cudnn_conv_algo_search": "EXHAUSTIVE",
-            }),
-            ("CPUExecutionProvider", {}),
-        ]
+        # Use CUDA only — no CPU fallback.
+        # FP16 models will fail on CPU, and ORT's fallback behavior
+        # (reloading the session on CPU after a CUDA runtime error)
+        # produces confusing errors. Better to fail fast on CUDA.
+        if "CUDAExecutionProvider" in available_providers:
+            providers = [
+                ("CUDAExecutionProvider", {
+                    "device_id": 0,
+                    "arena_extend_strategy": "kSameAsRequested",
+                    "cudnn_conv_algo_search": "EXHAUSTIVE",
+                })
+            ]
+        else:
+            providers = [("CPUExecutionProvider", {})]
 
     sess_options = ort.SessionOptions()
     sess_options.enable_mem_pattern = False
