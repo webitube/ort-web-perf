@@ -1,0 +1,13 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "conda": true,
+        "/^conda activate ort-web-perf ; python -c \"from safetensors\\.torch import load_file; tensors = load_file\\(r'd:\\\\Dev\\\\ort-web-perf\\\\mangledMerge\\\\mangledMerge_v3\\.safetensors', device='cpu'\\); keys = list\\(tensors\\.keys\\(\\)\\); prefixes = set\\(\\); \\[prefixes\\.add\\(k\\.split\\('\\.'\\)\\[0\\]\\) for k in keys\\]; print\\('Top-level prefixes:', sorted\\(prefixes\\)\\); print\\(\\); \\[print\\(k\\) for k in sorted\\(keys\\) if not k\\.startswith\\('model\\.'\\)\\]\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^conda activate ort-web-perf ; python -c \"import diffusers; print\\('diffusers version:', diffusers\\.__version__\\); import os; scripts_dir = os\\.path\\.join\\(os\\.path\\.dirname\\(diffusers\\.__file__\\), 'scripts'\\); print\\('scripts dir:', scripts_dir\\); convert_script = os\\.path\\.join\\(scripts_dir, 'convert_original_stable_diffusion_to_diffusers\\.py'\\); print\\('convert script exists:', os\\.path\\.exists\\(convert_script\\)\\)\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
