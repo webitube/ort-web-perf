@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 
+import numpy as np
 import onnx
 
 
@@ -315,15 +316,65 @@ def step2_export_onnx(diffusers_dir, output_onnx_dir):
     os.makedirs(unet_dir, exist_ok=True)
     unet = pipeline.unet.eval()
     unet.to("cpu")
-    
+
+    # Check if the model uses v_prediction (SD 2.x default)
+    # If so, wrap the UNet to convert v → epsilon at export time
+    # so the ONNX output matches what the web engine expects (epsilon).
+    prediction_type = pipeline.scheduler.config.prediction_type
+    print(f"  Scheduler prediction_type: {prediction_type}")
+
+    if prediction_type == "v_prediction":
+        print("  Wrapping UNet with v→epsilon conversion layer...")
+
+        # Build alphas_cumprod table from scheduler betas
+        betas = pipeline.scheduler.betas.numpy()
+        alphas = 1.0 - betas
+        alphas_cumprod = np.cumprod(alphas)
+
+        class VToEpsilonWrapper(torch.nn.Module):
+            """Wraps a v-prediction UNet to output epsilon instead of v.
+
+            Diffusers v_prediction formula (from DDIMScheduler.step):
+                pred_epsilon = sqrt(alpha_prod_t) * model_output + sqrt(beta_prod_t) * sample
+            
+            Where:
+                alpha_prod_t = alphas_cumprod[timestep]
+                beta_prod_t  = 1 - alpha_prod_t
+                model_output = v (UNet output)
+                sample       = x_t (current latent)
+            """
+            def __init__(self, unet, alphas_cumprod):
+                super().__init__()
+                self.unet = unet
+                # Store alphas_cumprod as a buffer (1000 entries, indices 0-999)
+                # Timesteps passed to the UNet directly index into this array.
+                self.register_buffer(
+                    "alphas_cumprod",
+                    torch.tensor(alphas_cumprod, dtype=torch.float32),
+                )
+
+            def forward(self, sample, timestep, encoder_hidden_states):
+                v = self.unet(sample, timestep, encoder_hidden_states)[0]
+                # Clamp timestep to valid range [0, 999]
+                t = torch.clamp(timestep, 0, len(self.alphas_cumprod) - 1)
+                alpha_prod_t = self.alphas_cumprod[t].view(-1, 1, 1, 1).expand(-1, *sample.shape[1:])
+                beta_prod_t = 1.0 - alpha_prod_t
+                # diffusers v_prediction -> epsilon conversion
+                epsilon = torch.sqrt(alpha_prod_t) * v + torch.sqrt(beta_prod_t) * sample
+                return epsilon
+
+        wrapped_unet = VToEpsilonWrapper(unet, alphas_cumprod).eval()
+    else:
+        wrapped_unet = unet
+
     # Create dummy inputs for UNet
     sample = torch.randn(1, 4, 64, 64, dtype=torch.float32)
     timestep = torch.tensor([1], dtype=torch.long)
     encoder_hidden_states = torch.randn(1, 77, 1024, dtype=torch.float32)
-    
+
     unet_path = os.path.join(unet_dir, "model.onnx")
     torch.onnx.export(
-        unet,
+        wrapped_unet,
         (sample, timestep, encoder_hidden_states),
         unet_path,
         input_names=["sample", "timestep", "encoder_hidden_states"],

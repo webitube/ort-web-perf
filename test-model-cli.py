@@ -2,8 +2,12 @@
 CLI test program that mirrors the web-txt2img engine pipeline to validate
 a converted ONNX model's ability to load and run inference.
 
-Pipeline (matches sd-turbo.ts adapter):
-  tokenize → text_encoder → unet (1-step) → vae_decoder → PNG
+Supports both SD-Turbo (Euler, 1-step) and SD 2.1 (DDIM, multi-step) models.
+Auto-detects model type from scheduler config.
+
+Pipeline:
+  SD-Turbo: tokenize → text_encoder → unet (1-step Euler) → vae_decoder → PNG
+  SD 2.1:   tokenize → text_encoder → unet (N-step DDIM) → vae_decoder → PNG
 
 Usage:
     conda activate ort-web-perf
@@ -12,19 +16,21 @@ Usage:
         --prompt "a photo of an astronaut riding a horse" ^
         --output test-output.png
 
-    # Test with custom model
+    # Test with SD 2.1 model (auto-detects DDIM scheduler)
     python test-model-cli.py ^
-        --model-path mangledMerge-onnx ^
+        --model-path mangledMerge-onnx-fp16 ^
         --prompt "a castle in the clouds" ^
+        --steps 20 ^
         --output castle.png
 """
 
 import argparse
+import json
+import math
 import os
+import struct
 import sys
 import time
-import math
-import struct
 import zlib
 
 import numpy as np
@@ -58,6 +64,23 @@ def get_args():
     parser.add_argument(
         "--height", type=int, default=512,
         help="Output image height (default: 512)"
+    )
+    parser.add_argument(
+        "--steps", type=int, default=20,
+        help="Number of denoising steps for DDIM scheduler (default: 20)"
+    )
+    parser.add_argument(
+        "--guidance-scale", type=float, default=4.0,
+        help="Classifier-Free Guidance scale for DDIM scheduler (default: 4.0). Set to 1.0 to disable CFG."
+    )
+    parser.add_argument(
+        "--negative-prompt", default="",
+        help="Negative prompt for CFG (default: empty string)"
+    )
+    parser.add_argument(
+        "--scheduler", default="auto",
+        choices=["auto", "ddim", "euler"],
+        help="Scheduler to use (default: auto-detect from model config). Override to use Euler with DDIM models."
     )
     parser.add_argument(
         "--provider", default="auto",
@@ -126,32 +149,142 @@ def randn_latents(shape, sigma, seed):
     return arr * sigma
 
 
-# ─── Scheduler helpers (matching sd-turbo.ts) ─────────────────────────────
+# ─── Model type detection ─────────────────────────────────────────────────
 
-def scale_model_inputs(latent, sigma):
-    """Scale latent inputs for the UNet, matching EulerDiscreteScheduler.scale_model_input().
+def detect_model_type(model_path):
+    """Detect if the model is SD-Turbo (Euler, 1-step) or SD 2.1 (DDIM, multi-step).
     
-    Scales by (sigma**2 + 1)**0.5 to match the Euler algorithm.
+    Reads scheduler config from model directory to determine the scheduler type.
+    Returns a dict with model type info.
     """
+    scheduler_config_path = os.path.join(model_path, "scheduler", "scheduler_config.json")
+    
+    if os.path.exists(scheduler_config_path):
+        with open(scheduler_config_path, "r") as f:
+            config = json.load(f)
+        class_name = config.get("_class_name", "")
+        prediction_type = config.get("prediction_type", "epsilon")
+        
+        if "Euler" in class_name:
+            return {
+                "type": "sd-turbo",
+                "scheduler": "euler",
+                "prediction_type": prediction_type,
+                "steps": 1,
+            }
+        elif "DDIM" in class_name:
+            return {
+                "type": "sd-2.1",
+                "scheduler": "ddim",
+                "prediction_type": prediction_type,
+                "steps": 20,
+            }
+    
+    # Fallback: check model_index.json
+    model_index_path = os.path.join(model_path, "model_index.json")
+    if os.path.exists(model_index_path):
+        with open(model_index_path, "r") as f:
+            index = json.load(f)
+        scheduler_entry = index.get("scheduler", [])
+        if len(scheduler_entry) >= 2 and "Euler" in scheduler_entry[1]:
+            return {"type": "sd-turbo", "scheduler": "euler", "prediction_type": "epsilon", "steps": 1}
+        if len(scheduler_entry) >= 2 and "DDIM" in scheduler_entry[1]:
+            return {"type": "sd-2.1", "scheduler": "ddim", "prediction_type": "v_prediction", "steps": 20}
+    
+    # Default fallback to SD-Turbo for backward compatibility
+    print("  ⚠ Could not detect model type, defaulting to SD-Turbo (Euler)")
+    return {"type": "sd-turbo", "scheduler": "euler", "prediction_type": "epsilon", "steps": 1}
+
+
+# ─── Scheduler helpers ────────────────────────────────────────────────────
+
+# Euler helpers (SD-Turbo, 1-step)
+def scale_model_inputs(latent, sigma):
+    """Scale latent inputs for the UNet, matching EulerDiscreteScheduler.scale_model_input()."""
     data = np.asarray(latent)
     return data / ((sigma**2 + 1) ** 0.5)
 
 
-def scheduler_step(out_sample, latent, sigma, sigma_next):
-    """Single scheduler step for SD-Turbo (epsilon prediction), matching web engine eulerStep().
-    
-    Uses the ORIGINAL (unscaled) latent, NOT the scaled model input.
-    Formula: x_{t-1} = x_t + epsilon * (sigma_{t-1} - sigma_t)
-    where epsilon is the UNet output and x_t is the current latent.
-    """
-    out_data = np.asarray(out_sample)
+def euler_scheduler_step(out_sample, latent, sigma, sigma_next):
+    """Single Euler scheduler step for SD-Turbo (epsilon prediction)."""
+    epsilon = np.asarray(out_sample)
     lat_data = np.asarray(latent)
-
-    epsilon = out_data
     dt = sigma_next - sigma
-    new_latents = lat_data + epsilon * dt
+    return lat_data + epsilon * dt
 
-    return new_latents
+
+# DDIM helpers (SD 2.1, multi-step)
+def build_ddim_alphas_cumprod(beta_start=0.00085, beta_end=0.012, num_train_timesteps=1000, beta_schedule="scaled_linear"):
+    """Build alphas_cumprod matching DDIMScheduler."""
+    if beta_schedule == "linear":
+        betas = np.linspace(beta_start, beta_end, num_train_timesteps, dtype=np.float64)
+    elif beta_schedule == "scaled_linear":
+        betas = np.linspace(beta_start**0.5, beta_end**0.5, num_train_timesteps, dtype=np.float64) ** 2
+    else:
+        raise ValueError(f"Unknown beta_schedule: {beta_schedule}")
+    alphas = 1.0 - betas
+    alphas_cumprod = np.cumprod(alphas, axis=0)
+    return alphas.astype(np.float32), alphas_cumprod.astype(np.float32)
+
+
+def generate_ddim_timesteps(num_inference_steps, num_train_timesteps=1000, steps_offset=1):
+    """Generate evenly-spaced timesteps matching DDIMScheduler.set_timesteps().
+    
+    Returns timesteps in DESCENDING order (high noise → low noise) for denoising.
+    """
+    step_ratio = num_train_timesteps // num_inference_steps
+    timesteps = np.arange(0, num_inference_steps) * step_ratio + steps_offset
+    timesteps = np.clip(timesteps, 0, num_train_timesteps - 1).astype(np.int64)
+    # Reverse to go from high noise (start) to low noise (end)
+    return timesteps[::-1]
+
+
+def ddim_scheduler_step(noise, model_output, timestep, timestep_prev, alpha_prod_t, alpha_prod_t_prev, eta=0.0, prediction_type="epsilon"):
+    """DDIM scheduler step, deterministic when eta=0.
+    
+    Matches DDIMScheduler.step() from diffusers.
+    Supports both 'epsilon' and 'v_prediction' prediction types.
+    
+    Args:
+        noise: current latent x_t
+        model_output: raw UNet output (epsilon or v-prediction depending on type)
+        timestep: current timestep t
+        timestep_prev: previous timestep t-1 (not directly used, for logging)
+        alpha_prod_t: alphas_cumprod[t]
+        alpha_prod_t_prev: alphas_cumprod[t-1] (or 1.0 if t is the first step)
+        eta: noise strength (0.0 = deterministic)
+        prediction_type: 'epsilon' or 'v_prediction'
+    """
+    noise = np.asarray(noise, dtype=np.float32)
+    model_output = np.asarray(model_output, dtype=np.float32)
+
+    sqrt_alpha_prod = np.sqrt(alpha_prod_t)
+    sqrt_beta_prod = np.sqrt(1.0 - alpha_prod_t)
+
+    if prediction_type == "v_prediction":
+        # v_prediction: model predicts v = alpha*x - sqrt(beta)*epsilon
+        # Recover x_0 and epsilon from v (matches diffusers exactly)
+        pred_original_sample = sqrt_alpha_prod * noise - sqrt_beta_prod * model_output
+        pred_epsilon = sqrt_alpha_prod * model_output + sqrt_beta_prod * noise
+    else:
+        # epsilon prediction (default)
+        pred_epsilon = model_output
+        pred_original_sample = (noise - sqrt_beta_prod * pred_epsilon) / sqrt_alpha_prod
+
+    # Compute previous sample
+    sqrt_alpha_prod_prev = np.sqrt(alpha_prod_t_prev)
+    sqrt_beta_prod_prev = np.sqrt(1.0 - alpha_prod_t_prev)
+
+    if eta > 0.0:
+        # Stochastic: add variance noise
+        std_dev_t = eta * np.sqrt((1 - alpha_prod_t_prev) / (1 - alpha_prod_t) * (1 - alpha_prod_t / alpha_prod_t_prev))
+        pred_sample_direction = np.sqrt(1 - alpha_prod_t_prev - std_dev_t**2) * pred_epsilon
+        prev_sample = sqrt_alpha_prod_prev * pred_original_sample + pred_sample_direction + std_dev_t * noise
+    else:
+        # Deterministic (no variance)
+        prev_sample = sqrt_alpha_prod_prev * pred_original_sample + sqrt_beta_prod_prev * pred_epsilon
+
+    return prev_sample
 
 
 # ─── PNG encoder (minimal, no PIL dependency) ─────────────────────────────
@@ -272,6 +405,11 @@ def run_test(args):
     tokens = tokenize_prompt(tokenizer_dir, prompt)
     print(f"  Tokenized: {len(tokens)} tokens")
     print(f"  First 10:  {tokens[:10]}")
+    
+    # Tokenize negative prompt for CFG
+    negative_tokens = tokenize_prompt(tokenizer_dir, args.negative_prompt) if args.negative_prompt else None
+    if negative_tokens is not None:
+        print(f"  Negative prompt tokenized: {len(negative_tokens)} tokens")
 
     # Load ONNX sessions
     print("\n[3/6] Loading ONNX sessions...")
@@ -371,45 +509,205 @@ def run_test(args):
     print(f"  ✓ Encoded in {time.time() - start:.1f}s")
     print(f"    Output shape: {last_hidden_state.shape}")
 
+    # Detect model type (SD-Turbo vs SD 2.1)
+    model_info = detect_model_type(model_path)
+    
+    # Allow scheduler override
+    scheduler = args.scheduler if args.scheduler != "auto" else model_info["scheduler"]
+    
+    print(f"\n[4.5/6] Detected model type: {model_info['type']} (detected: {model_info['scheduler']}, using: {scheduler})")
+    print(f"  Prediction type: {model_info['prediction_type']}")
+    
+    # Use user-specified steps if provided, otherwise use model default
+    num_inference_steps = args.steps if args.steps > 1 else model_info["steps"]
+    if model_info["scheduler"] == "euler" and scheduler == "euler":
+        num_inference_steps = 1  # SD-Turbo is always 1-step
+    
     # Generate latents
-    print("\n[5/6] Running UNet (1-step denoising)...")
+    print(f"\n[5/6] Running UNet ({scheduler.upper()} {num_inference_steps}-step denoising)...")
     latent_shape = [1, 4, 64, 64]
-    sigma = 14.6146
     vae_scaling_factor = 0.18215
-
-    latent = randn_latents(latent_shape, sigma, seed)
-    latent_model_input = scale_model_inputs(latent, sigma)
-
-    timestep = np.array([999], dtype=np.int64)
-
-    # Build feed dynamically based on actual UNet input names
+    
+    # Build UNet input feed template
     unet_input_map = {inp.name: inp for inp in unet.get_inputs()}
-    feed = {}
-    for name, inp in unet_input_map.items():
-        if "sample" in name and "hidden" not in name:
-            feed[name] = latent_model_input
-        elif "timestep" in name:
-            feed[name] = timestep
-        elif "encoder" in name or "hidden" in name:
-            feed[name] = last_hidden_state
+    
+    if scheduler == "euler":
+        # ─── Euler denoising ──────────────────────────────────────────
+        # SD-Turbo uses 1-step, SD 2.1 can use multi-step Euler
+        is_sd_turbo = (model_info["scheduler"] == "euler")
+        
+        sigma = 14.6146
+        latent = randn_latents(latent_shape, sigma, seed)
+        
+        # Encode negative prompt for CFG (SD 2.1 with Euler)
+        guidance_scale = args.guidance_scale
+        if negative_tokens is not None and not is_sd_turbo:
+            neg_input_ids = np.array([negative_tokens], dtype=ids_dtype)
+            neg_encoder_inputs = {"input_ids": neg_input_ids}
+            for input_name in input_info:
+                if input_name != "input_ids":
+                    neg_encoder_inputs[input_name] = np.ones_like(neg_input_ids)
+            neg_hidden_state = text_encoder.run(None, neg_encoder_inputs)[0]
+        elif not is_sd_turbo:
+            neg_hidden_state = np.zeros_like(last_hidden_state)
+        
+        if not is_sd_turbo and guidance_scale > 1.0:
+            print(f"  ✓ CFG enabled (guidance_scale={guidance_scale})")
+        
+        # Euler timesteps for multi-step
+        if is_sd_turbo:
+            # SD-Turbo: single step at t=999
+            sigmas = [sigma, 0.0]
         else:
-            shape = [1 if (s is None or isinstance(s, str)) else s for s in inp.shape]
-            feed[name] = np.zeros(shape, dtype=np.float32)
-
-    start = time.time()
-    unet_outputs = unet.run(None, feed)
-    out_sample = unet_outputs[0]
-    print(f"  ✓ UNet inference in {time.time() - start:.1f}s")
-    print(f"    Output shape: {out_sample.shape}")
-
-    # Scheduler step (SD-Turbo: epsilon prediction, no CFG, 1 step)
-    # sigma_next = 0.0 (final step, target is fully denoised)
-    # IMPORTANT: use original latent (NOT scaled model input), matching web engine
-    sigma_next = 0.0
-    new_latents = scheduler_step(out_sample, latent, sigma, sigma_next)
-
+            # SD 2.1 Euler: generate sigmas from timesteps
+            timesteps = generate_ddim_timesteps(num_inference_steps, num_train_timesteps=1000, steps_offset=1)
+            # Convert timesteps to sigmas: sigma_t = sqrt((1-alpha_t)/alpha_t)
+            alphas, alphas_cumprod = build_ddim_alphas_cumprod(
+                beta_start=0.00085, beta_end=0.012, num_train_timesteps=1000, beta_schedule="scaled_linear"
+            )
+            sigmas = []
+            for t in timesteps:
+                alpha = float(alphas_cumprod[int(t)])
+                sigmas.append(np.sqrt((1.0 - alpha) / alpha))
+            sigmas.append(0.0)  # Final sigma = 0
+        
+        total_unet_time = 0.0
+        for i in range(len(sigmas) - 1):
+            sigma_curr = sigmas[i]
+            sigma_next = sigmas[i + 1]
+            
+            latent_model_input = scale_model_inputs(latent, sigma_curr)
+            timestep = np.array([999 if is_sd_turbo else int(timesteps[i])], dtype=np.int64)
+            
+            def run_unet(encoder_hidden, latent_input):
+                feed = {}
+                for name, inp in unet_input_map.items():
+                    if "sample" in name and "hidden" not in name:
+                        feed[name] = latent_input
+                    elif "timestep" in name:
+                        feed[name] = timestep
+                    elif "encoder" in name or "hidden" in name:
+                        feed[name] = encoder_hidden
+                    else:
+                        shape = [1 if (s is None or isinstance(s, str)) else s for s in inp.shape]
+                        feed[name] = np.zeros(shape, dtype=np.float32)
+                return unet.run(None, feed)[0]
+            
+            step_start = time.time()
+            
+            cond_output = run_unet(last_hidden_state, latent_model_input)
+            
+            if not is_sd_turbo and guidance_scale > 1.0:
+                uncond_output = run_unet(neg_hidden_state, latent_model_input)
+                out_sample = uncond_output + guidance_scale * (cond_output - uncond_output)
+            else:
+                out_sample = cond_output
+            
+            step_time = time.time() - step_start
+            total_unet_time += step_time
+            
+            # Euler scheduler step
+            new_latents = euler_scheduler_step(out_sample, latent, sigma_curr, sigma_next)
+            latent = new_latents
+            
+            if (i + 1) % 5 == 0 or i == 0:
+                print(f"  ✓ Step {i+1}/{len(sigmas)-1} (sigma={sigma_curr:.2f}) in {step_time:.2f}s "
+                      f"[latent: mean={latent.mean():.4f}, std={latent.std():.4f}]")
+        
+        print(f"  ✓ UNet denoising complete in {total_unet_time:.1f}s ({len(sigmas)-1} steps)")
+        print(f"    Output shape: {latent.shape}")
+        
+    else:
+        # ─── SD 2.1: DDIM multi-step denoising with CFG ───────────────
+        alphas, alphas_cumprod = build_ddim_alphas_cumprod(
+            beta_start=0.00085, beta_end=0.012, num_train_timesteps=1000, beta_schedule="scaled_linear"
+        )
+        timesteps = generate_ddim_timesteps(num_inference_steps, num_train_timesteps=1000, steps_offset=1)
+        
+        # Encode negative prompt for CFG
+        guidance_scale = args.guidance_scale
+        if negative_tokens is not None:
+            neg_input_ids = np.array([negative_tokens], dtype=ids_dtype)
+            neg_encoder_inputs = {"input_ids": neg_input_ids}
+            for input_name in input_info:
+                if input_name != "input_ids":
+                    neg_encoder_inputs[input_name] = np.ones_like(neg_input_ids)
+            neg_hidden_state = text_encoder.run(None, neg_encoder_inputs)[0]
+        else:
+            # Empty negative prompt: zeros
+            neg_hidden_state = np.zeros_like(last_hidden_state)
+        
+        if guidance_scale > 1.0:
+            print(f"  ✓ CFG enabled (guidance_scale={guidance_scale})")
+        else:
+            print(f"  ✓ CFG disabled (guidance_scale={guidance_scale})")
+        
+        # Initial pure Gaussian noise
+        latent = randn_latents(latent_shape, 1.0, seed)
+        
+        total_unet_time = 0.0
+        for i, t in enumerate(timesteps):
+            t_scalar = np.int64(t)
+            # Next timestep (lower, since timesteps are descending)
+            t_next = int(timesteps[i + 1]) if i + 1 < len(timesteps) else 0
+            
+            alpha_prod_t = float(alphas_cumprod[t_scalar])
+            alpha_prod_t_prev = float(alphas_cumprod[t_next])
+            
+            def run_unet(encoder_hidden):
+                feed = {}
+                for name, inp in unet_input_map.items():
+                    if "sample" in name and "hidden" not in name:
+                        feed[name] = latent
+                    elif "timestep" in name:
+                        feed[name] = np.array([t_scalar], dtype=np.int64)
+                    elif "encoder" in name or "hidden" in name:
+                        feed[name] = encoder_hidden
+                    else:
+                        shape = [1 if (s is None or isinstance(s, str)) else s for s in inp.shape]
+                        feed[name] = np.zeros(shape, dtype=np.float32)
+                return unet.run(None, feed)[0]
+            
+            step_start = time.time()
+            
+            # Run UNet with conditioned (positive) prompt
+            cond_output = run_unet(last_hidden_state)
+            
+            if guidance_scale > 1.0:
+                # Run UNet with unconditioned (negative) prompt
+                uncond_output = run_unet(neg_hidden_state)
+                # CFG: uncond + scale * (cond - uncond)
+                out_sample = uncond_output + guidance_scale * (cond_output - uncond_output)
+            else:
+                out_sample = cond_output
+            
+            step_time = time.time() - step_start
+            total_unet_time += step_time
+            
+            # Debug: check UNet output
+            if i == 0:
+                print(f"    [DEBUG] UNet cond output: mean={cond_output.mean():.4f}, std={cond_output.std():.4f}")
+                if guidance_scale > 1.0:
+                    print(f"    [DEBUG] UNet uncond output: mean={uncond_output.mean():.4f}, std={uncond_output.std():.4f}")
+                    print(f"    [DEBUG] CFG combined output: mean={out_sample.mean():.4f}, std={out_sample.std():.4f}")
+                print(f"    [DEBUG] alpha_prod_t={alpha_prod_t:.6f}, alpha_prod_t_prev={alpha_prod_t_prev:.6f}")
+            
+            # DDIM scheduler step (pass prediction_type for v_prediction support)
+            latent = ddim_scheduler_step(
+                latent, out_sample, t_scalar, t_next,
+                alpha_prod_t, alpha_prod_t_prev, eta=0.0,
+                prediction_type=model_info["prediction_type"]
+            )
+            
+            if (i + 1) % 5 == 0 or i == 0:
+                print(f"  ✓ Step {i+1}/{num_inference_steps} (t={t_scalar}) in {step_time:.2f}s "
+                      f"[latent: mean={latent.mean():.4f}, std={latent.std():.4f}]")
+        
+        print(f"  ✓ UNet denoising complete in {total_unet_time:.1f}s ({num_inference_steps} steps)")
+        print(f"    Output shape: {latent.shape}")
+    
     # Apply VAE scaling factor (matching web engine: scaleLatent divides by factor)
-    vae_latent = new_latents / vae_scaling_factor
+    vae_latent = latent / vae_scaling_factor
 
     # VAE decode
     print("\n[6/6] Running VAE decoder...")

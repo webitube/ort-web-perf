@@ -13,6 +13,14 @@
         "/^python test-model-cli\\.py --model-path sd-turbo-ort-web --prompt \"a photo of an astronaut riding a horse\" --output test-sd-turbo\\.png --seed 42$/": {
             "approve": true,
             "matchCommandLine": true
+        },
+        "/^python -c \"import onnxruntime as ort; m = ort\\.InferenceSession\\('mangledMerge-onnx-fp16/unet/model\\.onnx'\\); print\\('=== UNet Inputs ==='\\); \\[print\\(f'  \\{inp\\.name\\}: \\{inp\\.shape\\} \\{inp\\.type\\}'\\) for inp in m\\.get_inputs\\(\\)\\]; print\\('=== UNet Outputs ==='\\); \\[print\\(f'  \\{out\\.name\\}: \\{out\\.shape\\} \\{out\\.type\\}'\\) for out in m\\.get_outputs\\(\\)\\]\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^conda activate ort-web-perf; python -c \"\nimport numpy as np\nfrom diffusers import DDIMScheduler\n\n# SD 2\\.1 scheduler config \\(matches what the converter creates\\)\nscheduler = DDIMScheduler\\(\n    beta_start=0\\.00085,\n    beta_end=0\\.012,\n    beta_schedule='scaled_linear',\n    trained_betas=None,\n    clip_sample=False,\n    steps_offset=1,\n    prediction_type='epsilon',\n\\)\n\n# Generate 20-step timesteps\nscheduler\\.set_timesteps\\(20\\)\nprint\\('Timesteps:', scheduler\\.timesteps\\.tolist\\(\\)\\)\nprint\\('Num train timesteps:', scheduler\\.config\\.num_train_timesteps\\)\n\n# Check alphas_cumprod\nalphas_cumprod = scheduler\\.alphas_cumprod\\.numpy\\(\\)\nprint\\('alphas_cumprod\\[0\\]:', alphas_cumprod\\[0\\]\\)\nprint\\('alphas_cumprod\\[-1\\]:', alphas_cumprod\\[-1\\]\\)\n\n# For the first timestep \\(highest noise\\), what's the alpha\\?\nt0 = scheduler\\.timesteps\\[0\\]\nprint\\(f'First timestep: \\{t0\\}'\\)\nprint\\(f'alpha_cumprod\\[\\{t0\\}\\] = \\{alphas_cumprod\\[t0\\]\\}'\\)\n\"$/": {
+            "approve": true,
+            "matchCommandLine": true
         }
     }
 }
