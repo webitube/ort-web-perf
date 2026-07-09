@@ -1,0 +1,4 @@
+[submodule "HeuristicFeatureDetection"]
+	path = HeuristicFeatureDetection
+	url = https://github.com/webitube/HeuristicFeatureDetection.git
+	branch = master
