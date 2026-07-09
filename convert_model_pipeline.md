@@ -123,6 +123,7 @@ Install dependencies via:
 conda create -n ort-web-perf
 conda activate ort-web-perf
 conda install -c nvidia cuda-toolkit
+pip install numpy==1.26.4 //1.23.5
 pip install -U transformers diffusers optimum onnxruntime-gpu transformers onnx "optimum-onnx[onnxruntime-gpu]" accelerate onnxscript
 pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 ```
